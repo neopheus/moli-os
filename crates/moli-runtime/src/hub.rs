@@ -277,6 +277,9 @@ pub struct DeviceView {
     /// Prints documents (`/api/devices/{id}/print`).
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub printer: bool,
+    /// Live video the browser plays (`/api/devices/{id}/live`).
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub live: bool,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -316,7 +319,7 @@ struct Inner {
     /// Serializes address writes so the file always matches the book.
     address_write: tokio::sync::Mutex<()>,
     journal_log: Option<JournalLog>,
-    secrets: Option<SecretStore>,
+    secrets: Option<Arc<SecretStore>>,
     /// Why there is no secret store, in words a human can act on.
     secrets_problem: Option<String>,
     /// Values changed since the state cache was last written.
@@ -389,6 +392,7 @@ struct Model {
     labels: BTreeMap<DeviceId, Label>,
     snapshots: HashMap<DeviceId, Arc<dyn crate::media::SnapshotSource>>,
     printers: HashMap<DeviceId, Arc<dyn crate::media::PrintSink>>,
+    lives: HashMap<DeviceId, Arc<dyn crate::media::LiveSource>>,
 }
 
 #[derive(Debug)]
@@ -455,7 +459,7 @@ impl Hub {
             Some((path, master)) => match secrets::master_key_bytes(master)
                 .and_then(|key| SecretStore::open(path.clone(), &key))
             {
-                Ok(store) => (Some(store), None),
+                Ok(store) => (Some(Arc::new(store)), None),
                 Err(e) => {
                     tracing::error!(error = %e, "secret store unavailable");
                     (
@@ -1136,6 +1140,52 @@ impl Hub {
         );
     }
 
+    /// Journals a human's persisted driver installation without its address.
+    pub fn record_driver_added(
+        &self,
+        instance: InstanceId,
+        driver_kind: &str,
+        read_only: bool,
+        actor: Option<String>,
+        outcome: Outcome,
+    ) {
+        self.record(
+            Origin::Ui,
+            actor,
+            Action::DriverAdded {
+                instance,
+                driver_kind: driver_kind.to_owned(),
+                read_only,
+            },
+            outcome,
+            Instant::now(),
+        );
+    }
+
+    /// Journals a human's persisted driver edit without its address or secrets.
+    pub fn record_driver_configured(
+        &self,
+        instance: InstanceId,
+        driver_kind: &str,
+        enabled: bool,
+        read_only: bool,
+        actor: Option<String>,
+        outcome: Outcome,
+    ) {
+        self.record(
+            Origin::Ui,
+            actor,
+            Action::DriverConfigured {
+                instance,
+                driver_kind: driver_kind.to_owned(),
+                enabled,
+                read_only,
+            },
+            outcome,
+            Instant::now(),
+        );
+    }
+
     /// Records a persisted visibility edit and tells dashboards to reload the
     /// layout only when it succeeded. No device capability or state changes.
     pub fn record_visibility(
@@ -1213,6 +1263,28 @@ impl Hub {
                 device,
                 from: from.to_owned(),
                 to: to.to_owned(),
+            },
+            Outcome::Ok,
+            Instant::now(),
+        );
+    }
+
+    /// Journals a setting of the house changed by a person.
+    pub fn record_setting(
+        &self,
+        origin: Origin,
+        actor: Option<String>,
+        name: &str,
+        from: Option<Value>,
+        to: Value,
+    ) {
+        self.record(
+            origin,
+            actor,
+            Action::Setting {
+                name: name.to_owned(),
+                from,
+                to,
             },
             Outcome::Ok,
             Instant::now(),
@@ -1522,6 +1594,13 @@ impl Hub {
         self.0.secrets.is_some()
     }
 
+    pub(crate) fn durable_secrets(&self, instance: &InstanceId) -> Option<secrets::DurableSecrets> {
+        Some(secrets::DurableSecrets::new(
+            self.0.secrets.as_ref()?.clone(),
+            instance.to_string(),
+        ))
+    }
+
     pub(crate) fn secrets_problem(&self) -> Option<&str> {
         self.0.secrets_problem.as_deref()
     }
@@ -1649,6 +1728,54 @@ impl Hub {
             self.emit(event);
         }
         rx
+    }
+
+    /// Detaches an already stopped driver. Call only after cancelling and
+    /// awaiting its task: an old task must not publish over a replacement.
+    /// Labels, history and original cached definitions are retained.
+    pub fn unregister_driver(&self, instance: &InstanceId) {
+        let devices = {
+            let mut model = self.write();
+            if model.drivers.remove(instance).is_none() {
+                return;
+            }
+            let mut devices: Vec<_> = model
+                .devices
+                .values()
+                .filter(|device| &device.instance == instance)
+                .map(|device| (**device).clone())
+                .collect();
+            for device in &mut devices {
+                let states = model.states.get(&device.id).cloned().unwrap_or_default();
+                if let Some(cached) = model.cached_devices.get_mut(&device.id) {
+                    cached.states = states;
+                }
+                for point in &mut device.points {
+                    point.access.write = false;
+                }
+                model
+                    .devices
+                    .insert(device.id.clone(), Arc::new(device.clone()));
+                model.availability.insert(device.id.clone(), false);
+                model.unconfirmed.insert(device.id.clone(), false);
+                model.held_offline.remove(&device.id);
+                model.snapshots.remove(&device.id);
+                model.printers.remove(&device.id);
+            }
+            devices
+        };
+        for device in devices {
+            self.emit(Event::Availability {
+                device: device.id.clone(),
+                online: false,
+            });
+            self.emit(Event::DeviceUpserted {
+                device: Arc::new(device),
+            });
+        }
+        self.emit(Event::DriverUnregistered {
+            instance: instance.clone(),
+        });
     }
 
     pub(crate) fn set_driver_status(&self, instance: &InstanceId, status: DriverStatus) {
@@ -1884,6 +2011,7 @@ impl Hub {
             model.availability.remove(id);
             model.snapshots.remove(id);
             model.printers.remove(id);
+            model.lives.remove(id);
             let removed = model.devices.remove(id).is_some();
             if states_removed || restored_removed || cached_removed || removed {
                 self.0.state_dirty.store(true, Ordering::Release);
@@ -1909,6 +2037,42 @@ impl Hub {
         source: Arc<dyn crate::media::SnapshotSource>,
     ) {
         self.write().snapshots.insert(device.clone(), source);
+    }
+
+    pub(crate) fn provide_live(
+        &self,
+        device: &DeviceId,
+        source: Arc<dyn crate::media::LiveSource>,
+    ) {
+        self.write().lives.insert(device.clone(), source);
+    }
+
+    /// The device's answer to a browser's offer for its live video. The
+    /// source is called without the model lock.
+    pub async fn live_answer(
+        &self,
+        device: &DeviceId,
+        offer: String,
+        viewer: Option<std::net::IpAddr>,
+    ) -> Result<String, crate::media::LiveError> {
+        use crate::media::LiveError;
+        let source = {
+            let model = self.read();
+            if !model.devices.contains_key(device) {
+                return Err(LiveError::UnknownDevice);
+            }
+            model.lives.get(device).cloned().ok_or(LiveError::NoLive)?
+        };
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            source.answer(offer, viewer),
+        )
+        .await
+        {
+            Ok(Ok(answer)) => Ok(answer),
+            Ok(Err(e)) => Err(LiveError::Failed(format!("{e:#}"))),
+            Err(_) => Err(LiveError::Timeout),
+        }
     }
 
     pub(crate) fn provide_printing(
@@ -2194,6 +2358,7 @@ impl Model {
             state: self.states.get(&device.id).cloned().unwrap_or_default(),
             camera: self.snapshots.contains_key(&device.id),
             printer: self.printers.contains_key(&device.id),
+            live: self.lives.contains_key(&device.id),
         }
     }
 }

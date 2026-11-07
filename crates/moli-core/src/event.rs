@@ -48,6 +48,10 @@ pub enum Event {
         kind: String,
         integration: Arc<str>,
     },
+    /// A configured driver was stopped and detached; its known devices remain.
+    DriverUnregistered {
+        instance: InstanceId,
+    },
     LabelChanged {
         device: DeviceId,
         label: Label,
@@ -159,6 +163,19 @@ pub enum Origin {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Action {
+    /// A person's persisted integration installation; no address or credential.
+    DriverAdded {
+        instance: InstanceId,
+        driver_kind: String,
+        read_only: bool,
+    },
+    /// A person's persisted integration change; no address or credential.
+    DriverConfigured {
+        instance: InstanceId,
+        driver_kind: String,
+        enabled: bool,
+        read_only: bool,
+    },
     Command {
         point: PointId,
         value: Value,
@@ -195,6 +212,14 @@ pub enum Action {
         device: Option<DeviceId>,
         from: String,
         to: String,
+    },
+    /// A setting of the house changed by a person (`energy.price`, the price
+    /// of a kWh): what it was, what it is now.
+    Setting {
+        name: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        from: Option<Value>,
+        to: Value,
     },
 }
 
