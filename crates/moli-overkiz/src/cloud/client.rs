@@ -15,6 +15,7 @@ use tokio::time::Instant;
 /// Owned by one actor. All mutating futures borrow exclusively, including persistence.
 pub(crate) struct CloudClient<T = Https> {
     instance: String,
+    execution_read_only: bool,
     transport: T,
     session: Option<Session>,
     dirty: bool,
@@ -42,6 +43,7 @@ impl<T: Transport> CloudClient<T> {
         }
         Ok(Self {
             instance: instance.into(),
+            execution_read_only: true,
             transport,
             session: None,
             dirty: false,
@@ -578,7 +580,8 @@ impl<T: Transport> CloudClient<T> {
             Endpoint::Collection(_)
             | Endpoint::Location
             | Endpoint::Devices
-            | Endpoint::Gateways => self
+            | Endpoint::Gateways
+            | Endpoint::Scenario => self
                 .session
                 .as_ref()
                 .ok_or(Error::LoginRequired)?
@@ -594,6 +597,9 @@ impl<T: Transport> CloudClient<T> {
         query: Query,
         sink: &mut impl SessionSink,
     ) -> Result<Response, Error> {
+        if endpoint == Endpoint::Scenario {
+            return Err(Error::InvalidInput);
+        }
         self.check_rate()?;
         self.persist(sink).await?;
         let site = self.authentication_scope(endpoint)?;
@@ -962,3 +968,6 @@ fn region_for_country(country: &str) -> Option<Region> {
         _ => None,
     }
 }
+
+#[path = "client_execution.rs"]
+mod scenario_execution;
