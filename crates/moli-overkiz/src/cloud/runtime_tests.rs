@@ -2264,3 +2264,6 @@ async fn ownership_handoff_reloads_private_quota_and_pending_from_a_later_writer
     rig.script.hub = second;
     check(&rig, Check::HandoffQuota).await;
 }
+
+#[path = "scenario_runtime_tests.rs"]
+mod scenario_execution_tests;

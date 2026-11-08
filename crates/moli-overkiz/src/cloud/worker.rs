@@ -18,6 +18,11 @@ const COMMAND_CAPACITY: usize = 1;
 pub(crate) enum Work {
     Request(RequestEnvelope),
     Observe,
+    Execute(
+        moli_runtime::CommandRequest,
+        Box<super::execution::Ticket>,
+        moli_runtime::PrivateState,
+    ),
 }
 // Never derive Debug: session bytes and catalogues are private.
 pub(crate) enum Event {
@@ -128,6 +133,9 @@ fn spawn<T: Transport + 'static>(
                                 .await,
                             true,
                         ),
+                        PendingRequest::ScenarioPermission { .. } => {
+                            (id, Err(Error::InvalidInput), false)
+                        }
                         PendingRequest::Refresh { generation } => {
                             let result = if client.state().generation.as_ref() == Some(&generation)
                             {
@@ -140,6 +148,13 @@ fn spawn<T: Transport + 'static>(
                     }
                 }
                 Work::Observe => (None, client.retry_persistence(&mut sink).await, true),
+                Work::Execute(command, ticket, lifetime) => (
+                    None,
+                    client
+                        .execute_command(command, &ticket, &lifetime, &mut sink)
+                        .await,
+                    true,
+                ),
             };
             let mut observed = false;
             let result = if result.is_ok() && observe {
@@ -274,6 +289,23 @@ struct Job {
     task: JobTask,
     kind: JobKind,
 }
+#[derive(Clone, Copy)]
+enum ScenarioMode {
+    ReadOnly,
+    Consented,
+}
+impl ScenarioMode {
+    const fn new(read_only: bool) -> Self {
+        if read_only {
+            Self::ReadOnly
+        } else {
+            Self::Consented
+        }
+    }
+    const fn read_only(self) -> bool {
+        matches!(self, Self::ReadOnly)
+    }
+}
 #[derive(Default)]
 struct Ownership {
     lease: Option<Arc<moli_runtime::DurableLease>>,
@@ -313,14 +345,18 @@ pub(crate) struct Controller {
     next_poll: Instant,
     gate: Gate,
     poll: Duration,
+    scenario_mode: ScenarioMode,
 }
 impl Controller {
     pub(crate) fn new(ctx: &DriverCtx, config: &super::Config) -> Self {
+        let read_only = config.read_only;
         Self::with_factory(
             ctx,
             config,
-            Box::new(|instance, epoch, session, catalog, lease| {
-                spawn(CloudClient::new(instance)?, epoch, session, catalog, lease)
+            Box::new(move |instance, epoch, session, catalog, lease| {
+                let mut client = CloudClient::new(instance)?;
+                client.execution_read_only(read_only);
+                spawn(client, epoch, session, catalog, lease)
             }),
         )
     }
@@ -330,17 +366,14 @@ impl Controller {
         config: &super::Config,
         transport: T,
     ) -> Self {
+        let read_only = config.read_only;
         Self::with_factory(
             ctx,
             config,
             Box::new(move |instance, epoch, session, catalog, lease| {
-                spawn(
-                    CloudClient::with_transport(instance, transport.clone())?,
-                    epoch,
-                    session,
-                    catalog,
-                    lease,
-                )
+                let mut client = CloudClient::with_transport(instance, transport.clone())?;
+                client.execution_read_only(read_only);
+                spawn(client, epoch, session, catalog, lease)
             }),
         )
     }
@@ -372,6 +405,7 @@ impl Controller {
             next_poll: Instant::now(),
             gate,
             poll: Duration::from_secs(config.poll_secs),
+            scenario_mode: ScenarioMode::new(config.read_only),
         };
         this.restart(ctx, false);
         this.publish(ctx, None);
@@ -757,49 +791,24 @@ impl Controller {
             return;
         }
         if self.migration == Migration::Pending {
-            if Instant::now() >= self.next_poll {
-                match super::storage::legacy(ctx) {
-                    Ok(entries) => {
-                        let storage = self.storage.clone();
-                        self.job = Some(Job {
-                            task: JobTask::Write(tokio::spawn(async move {
-                                let storage = storage.ok_or_else(|| {
-                                    std::io::Error::other("private storage unavailable")
-                                })?;
-                                storage
-                                    .migrate(
-                                        entries,
-                                        [
-                                            super::STATE_KEY,
-                                            inventory::INVENTORY_KEY,
-                                            super::PENDING_KEY,
-                                        ]
-                                        .into_iter()
-                                        .map(str::to_owned)
-                                        .collect(),
-                                    )
-                                    .await
-                            })),
-                            kind: JobKind::Migration { epoch: self.epoch },
-                        });
-                    }
-                    Err(error) => {
-                        self.warning = Some(error.to_string());
-                        self.next_poll = Instant::now() + Duration::from_secs(60);
-                    }
-                }
-            }
+            self.migrate_legacy(ctx);
             return;
         }
         if self.actor.is_none() && Instant::now() >= self.next_poll {
             self.restart(ctx, false);
         }
-        if self
+        if let Some(pending) = self
             .storage
             .as_ref()
             .and_then(|storage| storage.get(super::PENDING_KEY))
-            .is_some()
         {
+            if self.busy
+                && super::decode_request(pending.as_bytes()).is_ok_and(|request| {
+                    matches!(request.request, PendingRequest::ScenarioPermission { .. })
+                })
+            {
+                return;
+            }
             let permit = if self.gate.open() {
                 let Some(actor) = &self.actor else {
                     return;
@@ -839,9 +848,49 @@ impl Controller {
             self.busy = true;
         }
     }
+    fn migrate_legacy(&mut self, ctx: &DriverCtx) {
+        if Instant::now() >= self.next_poll {
+            match super::storage::legacy(ctx) {
+                Ok(entries) => {
+                    let storage = self.storage.clone();
+                    self.job = Some(Job {
+                        task: JobTask::Write(tokio::spawn(async move {
+                            let storage = storage.ok_or_else(|| {
+                                std::io::Error::other("private storage unavailable")
+                            })?;
+                            storage
+                                .migrate(
+                                    entries,
+                                    [
+                                        super::STATE_KEY,
+                                        inventory::INVENTORY_KEY,
+                                        super::PENDING_KEY,
+                                        super::execution::POLICY_KEY,
+                                    ]
+                                    .into_iter()
+                                    .map(str::to_owned)
+                                    .collect(),
+                                )
+                                .await
+                        })),
+                        kind: JobKind::Migration { epoch: self.epoch },
+                    });
+                }
+                Err(error) => {
+                    self.warning = Some(error.to_string());
+                    self.next_poll = Instant::now() + Duration::from_secs(60);
+                }
+            }
+        }
+    }
     fn consume(&mut self, ctx: &DriverCtx, permit: Option<mpsc::OwnedPermit<Work>>, bytes: &str) {
         match super::decode_request(bytes.as_bytes()) {
             Ok(request) => {
+                if matches!(request.request, PendingRequest::ScenarioPermission { .. }) {
+                    drop(permit);
+                    self.permission(ctx, request);
+                    return;
+                }
                 let Some(permit) = permit.filter(|_| self.gate.open()) else {
                     self.reject_input(ctx, request.request_id);
                     return;
@@ -969,6 +1018,13 @@ impl Controller {
     }
 
     fn publish(&self, ctx: &DriverCtx, catalog: Option<&Catalog>) {
+        super::execution::publish(
+            ctx,
+            catalog,
+            self.scenario_mode.read_only(),
+            self.live,
+            self.poll.as_secs(),
+        );
         let id = super::summary_device_id(ctx.instance());
         ctx.upsert_device(summary(ctx.instance()));
         ctx.set_state(
@@ -1110,3 +1166,6 @@ fn now_ms() -> i64 {
 #[cfg(test)]
 #[path = "runtime_tests.rs"]
 mod tests;
+
+#[path = "worker_execution.rs"]
+mod scenario_execution;

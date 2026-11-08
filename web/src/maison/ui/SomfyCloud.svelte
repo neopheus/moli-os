@@ -20,6 +20,7 @@
   const row = $derived(view.instances.find(i => i.instance === view.selected));
   const connectable = $derived(row?.configured !== false && !row?.cleanup_pending);
   const connection = $derived(row?.state);
+  const permitted = $derived(view.catalog?.execution?.read_only === false && (view.catalog?.execution?.scenarios?.some(s => s.permitted) ?? false));
   const candidate = $derived(connection?.candidates?.find(c => c.site_oid === site));
   const effectiveRegion = $derived(candidate?.region ?? region);
 
@@ -71,15 +72,16 @@
 </script>
 
 <section class="somfy" aria-label={t('systeme.somfy.title')}>
-  <div class="section-heading"><div><h2>{t('systeme.somfy.catalog_title')}</h2></div><span class="badge"><Icon name="shield" size={16} />{t('systeme.somfy.read_only_badge')}</span></div>
+  <div class="section-heading"><div><h2>{t('systeme.somfy.catalog_title')}</h2></div><span class="badge"><Icon name="shield" size={16} />{t(permitted ? 'systeme.somfy.scenario.authorized_badge' : 'systeme.somfy.read_only_badge')}</span></div>
+  {#if view.pending}<p role="status">{t('systeme.somfy.pending')}</p>{/if}
   {#if view.loading}<p role="status">{t('systeme.somfy.loading')}</p>{/if}
   {#if view.auth === 'owner_account' || view.auth === 'pin_fallback'}
     <p>{t(`systeme.somfy.${view.auth}`)}</p>
     <button type="button" onclick={view.auth === 'pin_fallback' ? unlock : () => observer.open()}>{t(view.auth === 'pin_fallback' ? 'systeme.somfy.unlock' : 'systeme.somfy.reload')}</button>
   {:else if view.auth === 'owner'}
     {#if !view.instances.length}<p>{t('systeme.somfy.none')}</p>{:else}
-      {#if connectable && (connection?.phase !== 'ready' || !row?.online)}<SomfyCloudStatus {row} />{/if}
-      {#if connectable}<p class="permission-note">{t('systeme.somfy.read_only_explanation')}</p>{/if}
+      {#if connectable && (connection?.phase !== 'ready' || !row?.online || connection?.failure)}<SomfyCloudStatus {row} />{/if}
+      {#if connectable}<p class="permission-note">{t(permitted ? 'systeme.somfy.scenario.authorized_hint' : view.catalog?.execution?.read_only === false ? 'systeme.somfy.scenario.read_only_hint' : 'systeme.somfy.scenario.global_read_only_hint')}</p>{/if}
       {#if connection?.scope && connectable}
         <div class="actions">
           <button type="button" disabled={Boolean(view.pending) || view.reading} onclick={() => observer.send({ kind: 'refresh', generation: connection.generation })}><Icon name="repeat" size={18} />{t('systeme.somfy.refresh_provider')}</button>
@@ -87,7 +89,7 @@
       {/if}
       {#if view.reading}<p role="status">{t('systeme.somfy.loading')}</p>{/if}
       {#if view.catalog}
-        <SomfyCloudCatalog observation={view.catalog} details={view.details} busy={view.detailBusy} showDefinition={(kind, index) => observer.definition(kind, index)} />
+        <SomfyCloudCatalog observation={view.catalog} generation={connection?.generation} pending={Boolean(view.pending)} permission={(input) => observer.permission(input)} details={view.details} busy={view.detailBusy} showDefinition={(kind, index) => observer.definition(kind, index)} />
       {/if}
       <details class="account" open={!connection?.scope || !connectable}>
         <summary><strong>{t('systeme.somfy.account')}</strong><span>{t('systeme.somfy.account_hint')}</span></summary>
@@ -129,7 +131,6 @@
           <button class="primary" disabled={Boolean(view.pending) || !candidate || !gateway || !effectiveRegion}>{t('systeme.somfy.select')}</button>
         </form>
       {/if}
-      {#if view.pending}<p role="status">{t('systeme.somfy.pending')}</p>{/if}
       </details>
     {/if}
   {/if}

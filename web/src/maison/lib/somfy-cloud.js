@@ -45,24 +45,43 @@ export function createCloudObserver(change, transport = fetch, wait = pause) {
       lifetime.signal.removeEventListener('abort', cancel);
     } };
   }
-  async function call(url, options = {}) {
+  function retiredCatalog(catalog) {
+    return catalog ? { ...catalog, execution: null, freshness: { ...catalog.freshness, current: false } } : null;
+  }
+  function retireExecution() { emit({ catalog: retiredCatalog(view.catalog) }); }
+  async function call(url, options = {}, policyChange = false) {
+    const instance = view.selected;
     const response = await transport(url, { cache: 'no-store', signal: lifetime.signal, ...options });
     if (!active) throw new DOMException('Aborted', 'AbortError');
+    if (response.ok) return response;
+    const body = await response.json().catch(() => ({}));
+    const code = body.code ?? body.error;
+    if (response.status === 503 && code === 'cache_unavailable' && body.credentials_removed === true) {
+      if (instance === view.selected) {
+        selection++; listEpoch++;
+        clearConnection(instance, false);
+        emit({ reading: false, detailBusy: '' });
+      }
+      throw new Error('cache_unavailable');
+    }
+    if (policyChange) {
+      const codes = new Set(['invalid_pin', 'pin_disabled', 'pin_rate_limited', 'catalog_changed', 'global_read_only']);
+      if (codes.has(code)) {
+        if (code === 'catalog_changed' || code === 'global_read_only') retireExecution();
+        throw new Error(code);
+      }
+    }
     if (response.status === 403) {
-      const body = await response.json().catch(() => ({}));
       emit({ auth: body.auth_policy === 'pin_fallback' ? 'pin_fallback' : 'owner_account', instances: [], selected: '', catalog: null, catalogText: '', details: {} });
       throw new Error('owner');
     }
-    if (!response.ok) {
-      if (response.status === 503) {
-        const body = await response.json().catch(() => ({}));
-        if (body.error === 'cache_unavailable' && body.credentials_removed === true) throw new Error('cache_unavailable');
-      }
-      throw new Error(response.status === 409 ? 'changed_or_busy' : 'unavailable');
-    }
-    return response;
+    if (response.status === 409) retireExecution();
+    throw new Error(response.status === 409 ? 'changed_or_busy' : 'unavailable');
   }
-  function failed(error) { if (active && error.name !== 'AbortError') emit({ error: error.message === 'owner' ? '' : ['changed_or_busy', 'cache_unavailable'].includes(error.message) ? error.message : 'unavailable' }); }
+  function failed(error) {
+    const known = new Set(['changed_or_busy', 'invalid_pin', 'pin_disabled', 'pin_rate_limited', 'catalog_changed', 'global_read_only', 'permission_failed', 'cache_unavailable']);
+    if (active && error.name !== 'AbortError') emit({ error: error.message === 'owner' ? '' : known.has(error.message) ? error.message : 'unavailable' });
+  }
   async function list(signal = lifetime.signal) {
     const epoch = ++listEpoch;
     const body = await (await call(ROOT, { signal })).json();
@@ -70,11 +89,14 @@ export function createCloudObserver(change, transport = fetch, wait = pause) {
     const instances = body.instances ?? [];
     const selected = instances.some(i => i.instance === view.selected) ? view.selected : (instances[0]?.instance ?? '');
     const oldState = view.instances.find(i => i.instance === view.selected)?.state;
-    const nextState = instances.find(i => i.instance === selected)?.state;
+    const nextRow = instances.find(i => i.instance === selected);
+    const nextState = nextRow?.state;
     const identityChanged = view.selected !== selected || oldState?.generation !== nextState?.generation || ['site_oid', 'gateway_id', 'region'].some(key => oldState?.scope?.[key] !== nextState?.scope?.[key]);
-    if (identityChanged) {
+    if (identityChanged || nextRow?.cleanup_pending) {
       selection++;
       emit({ catalog: null, catalogText: '', details: {}, detailBusy: '', reading: false });
+    } else if (nextRow?.configured === false || nextRow?.online !== true) {
+      retireExecution();
     }
     emit({ instances, selected, auth: 'owner' });
   }
@@ -96,7 +118,15 @@ export function createCloudObserver(change, transport = fetch, wait = pause) {
     try {
       const text = await (await call(`${path()}/catalog`, { signal })).text();
       const data = JSON.parse(text); // Metadata only; exact response text remains the export.
-      if (epoch === selection) emit({ catalog: data, catalogText: text });
+      if (epoch === selection) {
+        const row = view.instances.find(i => i.instance === view.selected);
+        const current = row?.configured !== false && !row?.cleanup_pending && row?.online === true
+          && data.freshness?.current === true;
+        const qualified = current ? data : retiredCatalog(data);
+        // An unavailable scenario collection does not retire fresh calendar data.
+        emit({ catalog: current && data.freshness?.collections?.scenarios !== true
+          ? { ...qualified, execution: null } : qualified, catalogText: text });
+      }
     } catch (e) { if (epoch === selection) { emit({ catalog: null, catalogText: '' }); failed(e); } }
     finally { if (epoch === selection) emit({ reading: false }); }
   }
@@ -112,21 +142,22 @@ export function createCloudObserver(change, transport = fetch, wait = pause) {
     } catch (e) { if (epoch === selection) failed(e); }
     finally { if (epoch === selection) emit({ detailBusy: '' }); }
   }
-  async function send(input) {
+  async function dispatch(input, endpoint) {
     const row = view.instances.find(i => i.instance === view.selected);
-    if (sending || view.auth !== 'owner' || !view.selected || row?.configured === false || row?.cleanup_pending) { if ('password' in input) input.password = ''; return; }
+    if (disconnecting || sending || view.auth !== 'owner' || !view.selected || row?.configured === false || row?.cleanup_pending) { if ('password' in input) input.password = ''; if ('pin' in input) input.pin = ''; return; }
     sending = true;
     const deadline = requestDeadline(120000);
     emit({ pending: 'dispatch', error: '', notice: '' });
     try {
       // Nothing secret enters a PIN continuation, a timer, or the observable view.
-      const request = call(`${path()}/requests`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-moli-origin': 'ui' }, body: JSON.stringify(input), signal: deadline.signal });
-      if ('password' in input) input.password = '';
+      const request = call(`${path()}/${endpoint}`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-moli-origin': 'ui' }, body: JSON.stringify(input), signal: deadline.signal }, endpoint === 'scenario-permission');
+      if ('password' in input) input.password = ''; if ('pin' in input) input.pin = '';
       const { request_id: id } = await (await request).json();
       emit({ pending: id, catalog: null, catalogText: '', details: {} });
       for (let attempt = 0; attempt < 60 && active; attempt++) {
         await list(deadline.signal);
         if (requestFinished(view.instances.find(i => i.instance === view.selected), id)) {
+          if (endpoint === 'scenario-permission' && view.instances.find(i => i.instance === view.selected)?.state?.failure) throw new Error('permission_failed');
           if (view.instances.find(i => i.instance === view.selected)?.state?.scope) await catalog(deadline.signal);
           return;
         }
@@ -137,10 +168,15 @@ export function createCloudObserver(change, transport = fetch, wait = pause) {
     finally {
       deadline.dispose();
       if (active && deadline.signal.aborted) emit({ error: 'pending_timeout' });
-      if ('password' in input) input.password = '';
+      if ('password' in input) input.password = ''; if ('pin' in input) input.pin = '';
       sending = false;
       emit({ pending: null });
     }
+  }
+  function send(input) { return dispatch(input, 'requests'); }
+  async function permission(input) {
+    await dispatch(input, 'scenario-permission');
+    return active ? view.error : 'unavailable';
   }
   function clearConnection(instance, complete) {
     const instances = view.instances.flatMap(row => row.instance !== instance ? [row]
@@ -156,6 +192,7 @@ export function createCloudObserver(change, transport = fetch, wait = pause) {
     // In-flight reads belong to the old account view, including on a failed purge.
     selection++;
     listEpoch++;
+    retireExecution();
     emit({ pending: 'disconnect', error: '', notice: '', reading: false, detailBusy: '' });
     try {
       const response = await call(path(), { method: 'DELETE', headers: { 'x-moli-origin': 'ui' }, signal: deadline.signal });
@@ -181,5 +218,5 @@ export function createCloudObserver(change, transport = fetch, wait = pause) {
     selection++;
     emit({ selected: instance, catalog: null, catalogText: '', details: {}, detailBusy: '', reading: false, error: '', notice: '' });
   }
-  return { load, open, catalog, definition, send, disconnect, select, stop() { active = false; lifetime.abort(); view = null; } };
+  return { load, open, catalog, definition, send, permission, disconnect, select, stop() { active = false; lifetime.abort(); view = null; } };
 }

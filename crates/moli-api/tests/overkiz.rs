@@ -23,9 +23,15 @@ impl Server {
         Self::configured(name, false).await
     }
     async fn configured(name: &str, cloud: bool) -> Self {
-        Self::with_private_file(name, cloud, None).await
+        Self::mode(name, cloud, true).await
+    }
+    async fn mode(name: &str, cloud: bool, read_only: bool) -> Self {
+        Self::options(name, cloud, read_only, None).await
     }
     async fn with_private_file(name: &str, cloud: bool, private: Option<&[u8]>) -> Self {
+        Self::options(name, cloud, true, private).await
+    }
+    async fn options(name: &str, cloud: bool, read_only: bool, private: Option<&[u8]>) -> Self {
         let dir =
             std::env::temp_dir().join(format!("moli-cloud-api-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -47,9 +53,13 @@ impl Server {
             ..moli_api::Options::default()
         };
         if cloud {
-            options
-                .overkiz_cloud
-                .insert("fixture".into(), moli_overkiz::cloud::Config::default());
+            options.overkiz_cloud.insert(
+                "fixture".into(),
+                moli_overkiz::cloud::Config {
+                    read_only,
+                    ..Default::default()
+                },
+            );
         }
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap().to_string();
@@ -405,11 +415,12 @@ async fn recognized_owner_is_allowed_but_guest_member_and_pin_are_not_owners() {
     assert_eq!(denied["auth_policy"], "owner_account");
 }
 
-const CLOUD_KEYS: [&str; 4] = [
+const CLOUD_KEYS: [&str; 5] = [
     "cloud_session_v1",
     "cloud_pending_v1",
     "cloud_state_v1",
     "cloud_inventory_v1",
+    "cloud_scenario_permissions_v1",
 ];
 
 #[tokio::test]
@@ -420,6 +431,11 @@ async fn owner_disconnect_purges_legacy_cloud_after_configuration_removal_only_f
         let pin = server.pin().await;
         seed(&server).await;
         let instance = "fixture".into();
+        server
+            .hub
+            .store_secret(&instance, "cloud_scenario_permissions_v1", "PRIVATE_POLICY")
+            .await
+            .unwrap();
         server
             .hub
             .store_secret(&instance, "cloud_pending_v1", "PRIVATE_PENDING")
@@ -778,10 +794,71 @@ async fn unreadable_private_cache_does_not_trap_credentials_or_hide_an_unfinishe
 async fn disconnect_rejects_a_request_whose_body_was_still_arriving() {
     let server = Server::configured("disconnect-slow-input", true).await;
     let pin = server.pin().await;
-    let body = r#"{"kind":"refresh","generation":"generation-a"}"#;
+    disconnect_while_body_waits(
+        &server,
+        &pin,
+        "requests",
+        r#"{"kind":"refresh","generation":"generation-a"}"#,
+        false,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn scenario_permission_cannot_cross_disconnect_and_reconnection_while_body_waits() {
+    let server = Server::configured("disconnect-slow-permission", true).await;
+    let pin = server.pin().await;
+    seed(&server).await;
+    let body = json!({"generation":"generation-a","revision":"a".repeat(64),"scenario_id":"same","enabled":false,"pin":"482915"}).to_string();
+    disconnect_while_body_waits(&server, &pin, "scenario-permission", &body, true).await;
+}
+
+#[tokio::test]
+async fn unfinished_disconnect_blocks_permission_before_reading_its_body() {
+    let server = Server::with_private_file(
+        "partial-scenario-permission",
+        true,
+        Some(b"PRIVATE_CORRUPT_CACHE"),
+    )
+    .await;
+    let pin = server.pin().await;
+    seed(&server).await;
+    assert_eq!(
+        server
+            .json("DELETE", &format!("{ROOT}/fixture"), Value::Null, &pin)
+            .await
+            .0,
+        503
+    );
+    let (status, _, body) = server
+        .request(
+            "POST",
+            &format!("{ROOT}/fixture/scenario-permission"),
+            "invalid body",
+            &pin,
+        )
+        .await;
+    assert_eq!(status, 503);
+    let body: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(body["credentials_removed"], true);
+    assert!(
+        server
+            .hub
+            .secret(&"fixture".into(), "cloud_pending_v1")
+            .is_none()
+    );
+}
+
+async fn disconnect_while_body_waits(
+    server: &Server,
+    pin: &str,
+    route: &str,
+    body: &str,
+    reconnect: bool,
+) {
     let mut stream = tokio::net::TcpStream::connect(&server.addr).await.unwrap();
     let head = format!(
-        "POST {ROOT}/fixture/requests HTTP/1.1\r\nHost: {}\r\nConnection: close\r\nContent-Type: application/json\r\nCookie: {pin}\r\nExpect: 100-continue\r\nContent-Length: {}\r\n\r\n",
+        "POST {ROOT}/fixture/{route} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\nContent-Type: application/json\r\nCookie: {pin}\r\nExpect: 100-continue\r\nContent-Length: {}\r\n\r\n",
         server.addr,
         body.len()
     );
@@ -798,10 +875,15 @@ async fn disconnect_rejects_a_request_whose_body_was_still_arriving() {
     .unwrap();
     assert_eq!(continued, b"HTTP/1.1 100 Continue\r\n\r\n");
     let (status, _, result) = server
-        .json("DELETE", &format!("{ROOT}/fixture"), Value::Null, &pin)
+        .json("DELETE", &format!("{ROOT}/fixture"), Value::Null, pin)
         .await;
     assert_eq!(status, 200);
     assert_eq!(result["disconnected"], true);
+    if reconnect {
+        // Even the same visible catalogue must not transfer a waiting request
+        // into the new private lifetime created by DELETE.
+        seed(server).await;
+    }
     stream.write_all(body.as_bytes()).await.unwrap();
     let mut response = Vec::new();
     tokio::time::timeout(
@@ -1049,5 +1131,182 @@ async fn status_qualifies_historical_ready_with_authoritative_session_and_curren
             .unwrap(),
         original
     );
+    task.abort();
+}
+
+#[tokio::test]
+async fn scenario_permission_requires_fresh_pin_and_respects_global_read_only() {
+    let server = Server::configured("scenario-policy", true).await;
+    let cookie = server.pin().await;
+    seed(&server).await;
+    let path = format!("{ROOT}/fixture/scenario-permission");
+    let (_, _, catalog) = server
+        .json(
+            "GET",
+            &format!("{ROOT}/fixture/catalog"),
+            Value::Null,
+            &cookie,
+        )
+        .await;
+    let body = json!({"generation":"generation-a","revision":catalog["revision"],"scenario_id":"same","enabled":true,"pin":"wrong-PIN-sentinel"});
+    assert_eq!(
+        server.request("POST", &path, &body.to_string(), "").await.0,
+        403
+    );
+    let (status, _, error) = server.json("POST", &path, body.clone(), &cookie).await;
+    assert_eq!(status, 401);
+    assert_eq!(error["code"], "invalid_pin");
+    assert!(!error.to_string().contains("sentinel"));
+    let mut correct = body;
+    correct["pin"] = json!("482915");
+    let (status, _, error) = server.json("POST", &path, correct.clone(), &cookie).await;
+    assert_eq!(status, 403);
+    assert_eq!(error["code"], "global_read_only");
+    assert!(
+        server
+            .hub
+            .private_state(&"fixture".into())
+            .unwrap()
+            .get("cloud_pending_v1")
+            .is_none()
+    );
+    correct["enabled"] = json!(false);
+    let (status, _, result) = server.json("POST", &path, correct, &cookie).await;
+    assert_eq!(status, 202);
+    assert!(result["request_id"].is_string());
+    let saved = server
+        .hub
+        .private_state(&"fixture".into())
+        .unwrap()
+        .get("cloud_pending_v1")
+        .unwrap();
+    assert!(!saved.contains("482915") && !saved.contains("pin"));
+    let envelope = moli_overkiz::cloud::decode_request(saved.as_bytes()).unwrap();
+    assert_eq!(envelope.request_id, result["request_id"]);
+}
+
+#[tokio::test]
+async fn generic_observation_requests_cannot_bypass_permission_pin() {
+    let server = Server::configured("scenario-bypass", true).await;
+    let cookie = server.pin().await;
+    let payload = json!({"kind":"scenario_permission","generation":"generation-a","revision":"a".repeat(64),"scenario_id":"same","enabled":true});
+    let (status, _, _) = server
+        .json(
+            "POST",
+            &format!("{ROOT}/fixture/requests"),
+            payload,
+            &cookie,
+        )
+        .await;
+    assert_eq!(status, 400);
+    assert!(
+        server
+            .hub
+            .private_state(&"fixture".into())
+            .unwrap()
+            .get("cloud_pending_v1")
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn consent_rejects_stale_catalogues_and_pin_brute_force_without_queueing() {
+    let server = Server::mode("scenario-stale-limit", true, false).await;
+    let cookie = server.pin().await;
+    seed(&server).await;
+    let path = format!("{ROOT}/fixture/scenario-permission");
+    let mut request = json!({"generation":"generation-stale","revision":"a".repeat(64),"scenario_id":"same","enabled":false,"pin":"482915"});
+    let (status, _, error) = server.json("POST", &path, request.clone(), &cookie).await;
+    assert_eq!(status, 409);
+    assert_eq!(error["code"], "catalog_changed");
+    request["pin"] = json!("WRONG_SENTINEL");
+    for _ in 0..5 {
+        let (status, _, error) = server.json("POST", &path, request.clone(), &cookie).await;
+        assert_eq!(status, 401);
+        assert_eq!(error["code"], "invalid_pin");
+        assert!(!error.to_string().contains("SENTINEL"));
+    }
+    request["pin"] = json!("482915");
+    let (status, _, error) = server.json("POST", &path, request, &cookie).await;
+    assert_eq!(status, 429);
+    assert_eq!(error["code"], "pin_rate_limited");
+    assert!(
+        server
+            .hub
+            .private_state(&"fixture".into())
+            .unwrap()
+            .get("cloud_pending_v1")
+            .is_none()
+    );
+    assert_eq!(
+        server
+            .json(
+                "GET",
+                &format!("{ROOT}/fixture/catalog"),
+                Value::Null,
+                &cookie
+            )
+            .await
+            .0,
+        200,
+        "a wrong PIN never revokes the existing owner session"
+    );
+}
+
+#[tokio::test]
+async fn enabling_requires_the_exact_current_revision_and_known_scenario() {
+    let server = Server::mode("scenario-exact", true, false).await;
+    let cookie = server.pin().await;
+    seed(&server).await;
+    let task = moli_runtime::spawn_driver(
+        &server.hub,
+        "fixture".into(),
+        std::sync::Arc::new(Summary),
+        CancellationToken::new(),
+    );
+    for _ in 0..100 {
+        if server.hub.device(&"fixture:cloud:summary".into()).is_some() {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    let (_, _, catalog) = server
+        .json(
+            "GET",
+            &format!("{ROOT}/fixture/catalog"),
+            Value::Null,
+            &cookie,
+        )
+        .await;
+    assert_eq!(catalog["execution"]["scenarios"][0]["executable"], false);
+    assert_eq!(
+        catalog["execution"]["scenarios"][0]["reason"],
+        "permission_required"
+    );
+    let path = format!("{ROOT}/fixture/scenario-permission");
+    let mut request = json!({"generation":"generation-a","revision":"a".repeat(64),"scenario_id":"same","enabled":true,"pin":"482915"});
+    let (status, _, error) = server.json("POST", &path, request.clone(), &cookie).await;
+    assert_eq!(status, 409);
+    assert_eq!(error["code"], "catalog_changed");
+    request["revision"] = catalog["revision"].clone();
+    request["scenario_id"] = json!("unknown");
+    assert_eq!(
+        server.json("POST", &path, request.clone(), &cookie).await.0,
+        400
+    );
+    request["scenario_id"] = json!("same");
+    assert_eq!(server.json("POST", &path, request, &cookie).await.0, 202);
+    let queued = server
+        .hub
+        .private_state(&"fixture".into())
+        .unwrap()
+        .get("cloud_pending_v1")
+        .unwrap();
+    assert!(!queued.contains("482915"));
+    let request = moli_overkiz::cloud::decode_request(queued.as_bytes()).unwrap();
+    assert!(matches!(
+        request.request,
+        moli_overkiz::cloud::PendingRequest::ScenarioPermission { enabled: true, .. }
+    ));
     task.abort();
 }

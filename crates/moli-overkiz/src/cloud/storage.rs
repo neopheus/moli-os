@@ -46,6 +46,7 @@ pub(super) fn has_legacy(ctx: &moli_runtime::DriverCtx) -> bool {
         super::STATE_KEY,
         inventory::INVENTORY_KEY,
         super::PENDING_KEY,
+        super::execution::POLICY_KEY,
     ]
     .iter()
     .any(|name| ctx.secret(name).is_some())
@@ -71,6 +72,10 @@ pub(super) fn legacy(
             return Err(Error::InvalidInput);
         }
         entries.push((super::PENDING_KEY.into(), pending.clone(), pending));
+    }
+    if let Some(policy) = ctx.secret(super::execution::POLICY_KEY) {
+        let policy = super::execution::Policy::decode(policy.as_bytes())?.encode()?;
+        entries.push((super::execution::POLICY_KEY.into(), policy.clone(), policy));
     }
     Ok(entries)
 }

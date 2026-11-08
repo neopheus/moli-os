@@ -1,9 +1,11 @@
-# Somfy cloud programme observation
+# Somfy cloud observation and saved-scenario launches
 
 The optional cloud source complements the local Overkiz source with saved TaHoma
-programmes. It observes definitions; it does not execute, activate, edit, delete,
-reschedule or import them as Moli automations. Local device identities and local
-control policy remain independent.
+programmes. By default it only observes definitions. Saved scenarios may be launched through
+the separately authorized execution path below; programmes cannot be edited,
+deleted, rescheduled or imported as Moli automations. Local device identities and
+native command bindings remain unchanged. The global read-only option covers both
+sources; cloud scenario consent does not grant native device permissions.
 
 ## Protocol evidence and coverage
 
@@ -67,7 +69,9 @@ supported region.
 
 The provider issues no read-only OAuth scope for this flow. Read-only behaviour
 is enforced by the closed Moli transport: fixed HTTPS hosts, authentication POSTs
-and the enumerated GETs only. Optional metadata reads retain only timezone and
+and the enumerated GETs. The optional saved-scenario POST has its own runtime
+read-only fence and per-scenario consent; enabling the cloud source alone never
+permits it. Optional metadata reads retain only timezone and
 device URL/label mappings; gateway metadata verifies membership. No address,
 coordinates or arbitrary setup metadata is published.
 
@@ -272,8 +276,7 @@ qualified. All-minus-one **bounds** are absent; all-minus-one specific dates are
 unknown. Closure percentages are not inverted into opening percentages. Unknown
 commands retain their names rather than acquiring guessed semantics.
 
-This is a bounded frontend projection, without new requests, dependencies or
-execution controls. It indexes the existing catalogue once and shows up to 50
+This is a bounded frontend projection, without dependencies or provider requests merely to display it. It indexes the existing catalogue once and shows up to 50
 entries per family, 64 triggers and 100 actions per definition, 16 commands per
 action. The first three actions form a preview; the rest render when expanded.
 Truncation is explicit and the complete cached JSON remains available unchanged,
@@ -308,10 +311,55 @@ authenticated compatibility or the completeness of a real household inventory.
 ## Interface demonstration
 
 These screenshots use a fully fabricated setup with two scenarios and one entry
-in each other collection. They demonstrate the owner interface, not a successful
+in each other collection. They illustrate the observer-only interface; optional
+scenario launch controls are not shown. They do not demonstrate a successful
 connection to a real Somfy account. The displayed observation date and all labels,
 identifiers and definitions belong to that fixture.
 
 ![Readable days, times and actions on desktop](../../docs/images/somfy-programmes-desktop.jpg)
 
 ![Read-only programme on mobile](../../docs/images/somfy-programmes-mobile.jpg)
+
+## Optional saved-scenario launches
+
+Global `driver.options.read_only = true` always prevents execution. When the
+owner has explicitly enabled control for the integration, each saved scenario
+still requires separate consent with a fresh Moli PIN. Revocation remains
+available while globally read-only or offline. Consent is encrypted and bound to
+the connection generation, selected setup and full scenario definition; reconnecting or
+changing that definition requires authorization again. Starting Moli never
+replays a launch. Each opaque command value also binds the current catalogue
+revision. Revocation can cross a refresh without requiring the old revision;
+activation must match the exact current revision.
+
+The owner catalogue exposes a launch capability only when the source is online,
+the saved observation is current and the exact Hub point is writable. The UI
+uses that opaque capability through the existing Hub command API. Agents and
+unauthenticated household callers require human approval; guests cannot see or
+launch these multi-device scenarios even after assigning them a shared room.
+Every attempt passing the API authorization follows the Hub guard and journal.
+
+The official Classic bootstrap was fetched again without authentication on
+**2026-11-04 at 15:37 UTC**: 371,868 bytes, with the same SHA-256 documented above.
+Its `executeById` sends POST `exec/{actionGroupOID}` with an empty body and expects
+an `execId` string. Moli supports only that saved-id route, never arbitrary action
+payloads or scheduling POSTs. This is an observed interoperability interface,
+not a published API guarantee.
+
+Before submission Moli rereads gateway membership and the scenario definition.
+A missing or changed definition prevents submission. After those reads, the
+private lifetime is checked again under the vault lock, including changes made
+by another Moli process; the lock is released before network submission. A
+completed disconnect during a preparatory read prevents the scenario POST, and
+queued consent retains the lifetime captured before its HTTP body was read.
+A POST already dispatched before revocation may still execute at Somfy: Moli
+does not promise provider-side cancellation. These reads and the POST
+are **not atomic at Somfy**; no conditional revision is available. A concurrent
+external modification between the read and POST can therefore alter the actions
+executed. The acknowledgement means accepted by the provider, not physically
+completed. A timeout or ambiguous response is reported as uncertain and never
+retried automatically; check TaHoma before manually launching again.
+
+Execution tests use fabricated accounts, definitions and transports only. They do
+not establish authenticated provider compatibility or physical completion in a
+real home. See the [execution design and tests](../../docs/superpowers/specs/2026-11-04-tahoma-scenario-execution.md).

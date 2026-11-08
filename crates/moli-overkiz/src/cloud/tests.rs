@@ -240,7 +240,14 @@ fn request_and_state_are_bounded_and_debug_redacts_private_values() {
     );
     assert!(Config::default().validate().is_ok());
     for poll in [0, 299, 86401] {
-        assert!(Config { poll_secs: poll }.validate().is_err());
+        assert!(
+            Config {
+                poll_secs: poll,
+                ..Config::default()
+            }
+            .validate()
+            .is_err()
+        );
     }
     let state = ConnectionState::default();
     assert!(decode_state(&encode_state(&state).unwrap()).is_ok());
@@ -1403,3 +1410,6 @@ fn persisted_retry_after_and_failure_are_capped_on_decode() {
         })
     );
 }
+
+#[path = "scenario_transport_tests.rs"]
+mod scenario_transport_tests;
